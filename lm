@@ -198,6 +198,29 @@ cmd_panel() {
     fi
 }
 
+# Открыть попап расширения в Zen: браузерные сочетания работают только у
+# сфокусированного окна, поэтому сначала фокусируем Zen, потом посылаем клавиши.
+cmd_popup() {
+    # В этой версии Hyprland диспетчеры — Lua-функции: старый «focuswindow class:…»
+    # не работает, нужен hl.dsp.focus({window = …}).
+    if ! hyprctl dispatch 'hl.dsp.focus({window = "class:^zen$"})' >/dev/null 2>&1; then
+        err "не удалось сфокусировать окно Zen"
+        return 1
+    fi
+    sleep 0.5
+    active="$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""' 2>/dev/null)"
+    if [ "$active" != "zen" ]; then
+        err "фокус не на Zen (сейчас: ${active:-неизвестно}) — нажми Ctrl+Shift+U в браузере сам"
+        return 1
+    fi
+    if command -v wtype >/dev/null 2>&1; then
+        wtype -M ctrl -M shift -k u -m shift -m ctrl
+    else
+        err "нет wtype — нажми Ctrl+Shift+U в Zen сам"
+        return 1
+    fi
+}
+
 # --- план пространств Zen (проект zen-tabs) ---------------------------------
 
 PLAN_DIR="$HOME/.cache/zen-tabs"
@@ -326,6 +349,7 @@ ask|Спросить воркера — текст из буфера обмен�
 think|Решить ризонером — текст из буфера обмена
 tabs|Разобрать вкладки Zen по смыслу
 tabs-domain|Разобрать вкладки Zen по доменам
+popup|Открыть попап расширения в Zen (Ctrl+Shift+U)
 plan-show|План пространств Zen: показать текущий
 plan|План пространств Zen: пересчитать (4B на CPU, минуты) и раздать
 eval|Замер SemIf (144 авторских пункта)
@@ -346,6 +370,7 @@ run_action() {
         think) cmd_think --clip ;;
         tabs) cmd_tabs ;;
         tabs-domain) cmd_tabs --domain ;;
+        popup) cmd_popup ;;
         plan) cmd_plan_model && cmd_plan ;;
         plan-show) shift; cmd_plan_show ;;
         eval) (cd "$DIR" && ./semif-eval.sh) ;;
@@ -392,6 +417,7 @@ case "${1:-menu}" in
     eval) shift; (cd "$DIR" && ./semif-eval.sh) ;;
     logs) shift; cmd_logs "${1:-fast}" "${2:-25}" ;;
     panel) shift; cmd_panel "$@" ;;
+    popup) shift; cmd_popup "$@" ;;
     plan) shift; cmd_plan "$@" ;;
     plan-show) shift; cmd_plan_show ;;
     plan-serve) shift; cmd_plan_serve ;;
