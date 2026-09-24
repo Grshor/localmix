@@ -284,6 +284,13 @@ cmd_plan() { # посчитать план и поднять локальную 
         return 1
     }
     mv "$PLAN_DIR/plan.json.tmp" "$PLAN_DIR/plan.json"
+    # Обновляем вложенную копию плана в расширении: иначе попап будет показывать
+    # старый план, когда сервер недоступен.
+    if [ -x "$ZT/bin/make-xpi.sh" ]; then
+        if (cd "$ZT" && ./bin/make-xpi.sh >/dev/null 2>&1); then
+            printf 'пересобран %s/zen-tabs@local.xpi — переустанови его в Zen (about:addons → Install Add-on From File…)\n' "$ZT"
+        fi
+    fi
     cmd_plan_serve
 }
 
