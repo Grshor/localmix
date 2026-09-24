@@ -315,11 +315,23 @@ console.log(`ровно было бы ${Math.round(plan.totalTabs / rows.length)
 
 cmd_plan_serve() {
     mkdir -p "$PLAN_DIR"
+    # Основной путь — пользовательская служба systemd: она переживает и перезапуск
+    # браузера, и выход из этой сессии (разовый nohup умирал вместе с родителем).
+    if systemctl --user list-unit-files zen-tabs-plan.service >/dev/null 2>&1 &&
+        systemctl --user cat zen-tabs-plan.service >/dev/null 2>&1; then
+        systemctl --user start zen-tabs-plan.service 2>/dev/null
+        sleep 1
+        if port_alive "$PLAN_PORT"; then
+            echo "план раздаётся службой zen-tabs-plan: http://127.0.0.1:$PLAN_PORT/plan.json"
+            return 0
+        fi
+    fi
     if port_alive "$PLAN_PORT"; then
         echo "раздача уже идёт: http://127.0.0.1:$PLAN_PORT/plan.json"
         return 0
     fi
-    (cd "$PLAN_DIR" && nohup python3 -m http.server "$PLAN_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+    # Запасной путь, если службы нет: отсоединённый процесс (setsid — своя сессия).
+    (cd "$PLAN_DIR" && setsid nohup python3 -m http.server "$PLAN_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
      echo $! >"$PLAN_DIR/serve.pid")
     sleep 1
     if port_alive "$PLAN_PORT"; then
@@ -330,6 +342,10 @@ cmd_plan_serve() {
 }
 
 cmd_plan_stop() {
+    if systemctl --user is-active zen-tabs-plan.service >/dev/null 2>&1; then
+        systemctl --user stop zen-tabs-plan.service && echo "раздача плана остановлена (служба zen-tabs-plan)"
+        return 0
+    fi
     [ -f "$PLAN_DIR/serve.pid" ] || { echo "раздача не запущена"; return 0; }
     pid="$(cat "$PLAN_DIR/serve.pid")"
     kill "$pid" 2>/dev/null && echo "раздача плана остановлена (pid $pid)"
