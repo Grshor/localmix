@@ -223,7 +223,9 @@ cmd_popup() {
         err "нет wtype — нажми Ctrl+Shift+U в Zen сам"
         return 1
     fi
-    wtype -M ctrl -M shift -k u -m shift -m ctrl
+    # Alt+Shift+U, а не Ctrl+Shift+U: второе перехватывает GTK как ввод символа
+    # по коду (появляется подсказка «U+») и до расширения не доходит.
+    wtype -M alt -M shift -k u -m shift -m alt
     # Если аддона нет в базе профиля, клавиша, скорее всего, ничего не сделает:
     # временные аддоны исчезают при перезапуске Zen. Предупреждаем, а не молчим.
     if ! ext_in_db; then
