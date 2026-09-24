@@ -1,0 +1,277 @@
+#!/bin/sh
+# lm — одна команда на все локальные модели этой машины.
+#
+#   lm                     интерактивное меню (fzf) — то же, что открывает клавиша
+#   lm status              состояние серверов, порты, VRAM, размер ответа модели
+#   lm start [all|fast|think]   поднять серверы (fast = MiniCPM5-2B :8091, think = VibeThinker-3B :8092)
+#   lm stop                остановить
+#   lm restart             перезапустить
+#   lm ask "вопрос"        спросить воркера (MiniCPM); --clip — взять текст из буфера
+#   lm think "задача"      замкнутая задача ризонеру (VibeThinker); --clip — из буфера
+#   lm tabs [--domain]     разобрать вкладки Zen (проект zen-tabs)
+#   lm eval                замер SemIf на 144 авторских пунктах
+#   lm logs [fast|think]   последние строки лога
+#   lm up                  тихая проверка: 0 — оба сервера живы (для скриптов и меню)
+#   lm notify-status       уведомление рабочего стола с состоянием
+#
+# Всё остальное живёт в ~/Projects/localmix (start.sh, stop.sh, think.sh).
+set -u
+
+# Скрипт лежит в проекте, а в PATH попадает симлинком — путь надо разрешить,
+# иначе DIR укажет на ~/.local/bin и start.sh «не найдётся».
+SELF="$0"
+while [ -L "$SELF" ]; do
+    target="$(readlink "$SELF")"
+    case "$target" in
+        /*) SELF="$target" ;;
+        *) SELF="$(dirname "$SELF")/$target" ;;
+    esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+FAST_PORT="${FAST_PORT:-8091}"
+THINK_PORT="${THINK_PORT:-8092}"
+ZT="$HOME/Projects/zen-tabs"
+RUNTIME=0.2
+
+# Шим mise без выставленной версии падает («No version is set for shim: bun»),
+# поэтому ищем рабочий бинарь и проверяем его делом, а не наличием.
+find_bun() {
+    for candidate in "$HOME"/.local/share/mise/installs/bun/*/bin/bun "$(command -v bun 2>/dev/null)"; do
+        [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1 && {
+            printf '%s' "$candidate"
+            return 0
+        }
+    done
+    return 1
+}
+BUN="$(find_bun || echo bun)"
+
+say() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+
+alive() { # alive <порт>
+    curl -sf -m 2 -o /dev/null "http://127.0.0.1:$1/v1/models" 2>/dev/null
+}
+
+model_name() { # model_name <порт> — короткое имя модели из /v1/models
+    curl -sf -m 2 "http://127.0.0.1:$1/v1/models" 2>/dev/null |
+        sed -n 's/.*"model":"[^"]*\/\([^"]*\)\.gguf".*/\1/p' | head -1
+}
+
+free_vram() {
+    nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null |
+        awk -F', ' '{printf "%.1f GB занято, %.1f GB свободно", $1/1024, ($2-$1)/1024}'
+}
+
+status_line() { # status_line <fast|think> <порт> <подпись>
+    if alive "$2"; then
+        printf '  ● %-6s :%s  %s\n' "$1" "$2" "$(model_name "$2" || echo "$3")"
+    else
+        printf '  ○ %-6s :%s  выключен (%s)\n' "$1" "$2" "$3"
+    fi
+}
+
+cmd_status() {
+    say "Локальные модели:"
+    status_line fast "$FAST_PORT" "MiniCPM5-2B Q4, воркер"
+    status_line think "$THINK_PORT" "VibeThinker-3B Q4, ризонер"
+    say "  видео: $(free_vram)"
+    if [ -d "$ZT" ]; then
+        say "  разбор вкладок Zen: lm tabs (по доменам: lm tabs --domain)"
+    fi
+    if alive "$FAST_PORT" && alive "$THINK_PORT"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+cmd_notify_status() {
+    if cmd_status >/tmp/lm-status.$$ 2>&1; then
+        notify-send -i dialog-information "Локальные модели: работают" "$(cat /tmp/lm-status.$$)"
+    else
+        notify-send -i dialog-warning "Локальные модели: остановлены" "$(cat /tmp/lm-status.$$)"
+    fi
+    rm -f /tmp/lm-status.$$
+}
+
+cmd_start() {
+    case "${1:-all}" in
+        all | "") "$DIR/start.sh" ;;
+        fast | think) "$DIR/start.sh" "$1" ;;
+        *) err "lm start [all|fast|think]"; return 2 ;;
+    esac
+}
+
+cmd_stop() { "$DIR/stop.sh"; }
+
+cmd_ask() { # воркер: MiniCPM5-2B, рецепт из start.sh (min_p=0 обязателен)
+    if [ "${1:-}" = "--clip" ]; then
+        PROMPT="$(wl-paste --no-newline 2>/dev/null || true)"
+        [ -n "$PROMPT" ] || { err "буфер обмена пуст"; return 1; }
+    elif [ -n "${1:-}" ]; then
+        PROMPT="$1"
+    else
+        PROMPT="$(cat)"
+    fi
+    [ -n "$PROMPT" ] || { err "Пустой запрос."; return 2; }
+
+    BODY="$(PROMPT="$PROMPT" python3 -c '
+import json, os
+print(json.dumps({
+    "model": "local",
+    "messages": [
+        {"role": "system", "content": "Отвечай кратко и по делу, по-русски."},
+        {"role": "user", "content": os.environ["PROMPT"]},
+    ],
+    "max_tokens": 700, "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0,
+}))')"
+
+    RAW="$(curl -s -m 180 "http://127.0.0.1:$FAST_PORT/v1/chat/completions" \
+        -H 'Content-Type: application/json' -d "$BODY" 2>/dev/null)" || RAW=""
+    ANSWER="$(printf '%s' "$RAW" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())
+except Exception:
+    pass' 2>/dev/null)"
+    if [ -z "$ANSWER" ]; then
+        err "воркер не ответил — сервер на :$FAST_PORT запущен? (lm start fast)"
+        return 1
+    fi
+
+    printf '%s\n' "$ANSWER"
+    if [ "${1:-}" = "--clip" ]; then
+        printf '%s' "$ANSWER" | wl-copy 2>/dev/null && notify-send -i edit-copy "Ответ воркера — в буфере" "$(printf '%s' "$ANSWER" | cut -c1-200)"
+    fi
+}
+
+cmd_think() {
+    if [ "${1:-}" = "--clip" ]; then
+        PROMPT="$(wl-paste --no-newline 2>/dev/null || true)"
+        [ -n "$PROMPT" ] || { err "буфер обмена пуст"; return 1; }
+        OUT="$(printf '%s' "$PROMPT" | "$DIR/think.sh")" || return 1
+    elif [ -n "${1:-}" ]; then
+        OUT="$("$DIR/think.sh" "$1")" || return 1
+    else
+        OUT="$(cat | "$DIR/think.sh")" || return 1
+    fi
+    printf '%s\n' "$OUT"
+    if [ "${1:-}" = "--clip" ]; then
+        printf '%s' "$OUT" | wl-copy 2>/dev/null && notify-send -i edit-copy "Ответ ризонера — в буфере" "$(printf '%s' "$OUT" | tail -1 | cut -c1-200)"
+    fi
+}
+
+cmd_tabs() {
+    [ -d "$ZT" ] || { err "нет $ZT"; return 1; }
+    (cd "$ZT" && "$BUN" bin/plan.mjs "$@")
+}
+
+cmd_logs() {
+    case "${1:-fast}" in
+        fast) tail -n "${2:-25}" "$DIR/logs/fast.log" ;;
+        think) tail -n "${2:-25}" "$DIR/logs/think.log" ;;
+        *) err "lm logs [fast|think]"; return 2 ;;
+    esac
+}
+
+# Показать результат в плавающем терминале Omarchy и не закрыть окно сразу.
+# Нужен для кнопок меню, где вывод длиннее строки: план разбора вкладок, логи, замер.
+# Именно foot с app-id org.omarchy.terminal: правило Omarchy делает такие окна
+# плавающими (875x600, по центру). Терминал по умолчанию (WezTerm) под это правило
+# не подпадает и открыл бы обычный тайл в уже запущенном окне.
+cmd_panel() {
+    inner="lm $*; printf '\n\nEnter — закрыть'; read -r _"
+    if command -v foot >/dev/null 2>&1; then
+        exec foot --app-id=org.omarchy.terminal --title="Локальные модели" -e bash -c "$inner"
+    elif command -v xdg-terminal-exec >/dev/null 2>&1; then
+        exec xdg-terminal-exec --app-id=org.omarchy.terminal --title="Локальные модели" -e bash -c "$inner"
+    else
+        exec bash -c "$inner"
+    fi
+}
+
+# --- меню -------------------------------------------------------------------
+
+menu_items() {
+    cat <<'EOF'
+status|Состояние серверов
+start|Запустить оба сервера
+start-fast|Запустить воркера (MiniCPM 2B, :8091)
+start-think|Запустить ризонера (VibeThinker 3B, :8092)
+stop|Остановить всё
+restart|Перезапустить оба
+ask|Спросить воркера — текст из буфера обмена
+think|Решить ризонером — текст из буфера обмена
+tabs|Разобрать вкладки Zen по смыслу
+tabs-domain|Разобрать вкладки Zen по доменам
+eval|Замер SemIf (144 авторских пункта)
+logs-fast|Логи воркера
+logs-think|Логи ризонера
+EOF
+}
+
+run_action() {
+    case "$1" in
+        status) cmd_status ;;
+        start) cmd_start all ;;
+        start-fast) cmd_start fast ;;
+        start-think) cmd_start think ;;
+        stop) cmd_stop ;;
+        restart) cmd_stop; sleep 1; cmd_start all ;;
+        ask) cmd_ask --clip ;;
+        think) cmd_think --clip ;;
+        tabs) cmd_tabs ;;
+        tabs-domain) cmd_tabs --domain ;;
+        eval) (cd "$DIR" && ./semif-eval.sh) ;;
+        logs-fast) cmd_logs fast 40 ;;
+        logs-think) cmd_logs think 40 ;;
+        *) err "неизвестное действие: $1"; return 2 ;;
+    esac
+}
+
+cmd_menu() {
+    header="$(cmd_status 2>&1)"
+    choice="$(menu_items | fzf --height=100% --reverse --delimiter='\|' --with-nth=2 \
+        --prompt='локальные модели> ' --header="$header" --header-first --no-info)" || return 0
+    [ -n "$choice" ] || return 0
+    key="${choice%%|*}"
+    printf '\n→ %s\n\n' "${choice#*|}"
+    run_action "$key"
+    printf '\n(Enter — закрыть)'
+    read -r _ 2>/dev/null || true
+}
+
+# --- разбор аргументов ------------------------------------------------------
+
+case "${1:-menu}" in
+    menu | --list)
+        if [ "${1:-}" = "--list" ]; then menu_items; else cmd_menu; fi
+        ;;
+    status) cmd_status ;;
+    notify-status) cmd_notify_status ;;
+    up) cmd_status >/dev/null 2>&1 ;;
+    alive)
+        case "${2:-}" in
+            fast) alive "$FAST_PORT" ;;
+            think) alive "$THINK_PORT" ;;
+            *) err "lm alive [fast|think]"; exit 2 ;;
+        esac
+        ;;
+    start) shift; cmd_start "${1:-all}" ;;
+    stop) cmd_stop ;;
+    restart) run_action restart ;;
+    ask) shift; cmd_ask "${1:-}" ;;
+    think) shift; cmd_think "${1:-}" ;;
+    tabs) shift; cmd_tabs "$@" ;;
+    eval) shift; (cd "$DIR" && ./semif-eval.sh) ;;
+    logs) shift; cmd_logs "${1:-fast}" "${2:-25}" ;;
+    panel) shift; cmd_panel "$@" ;;
+    -h | --help | help)
+        sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        err "неизвестная команда: $1 (lm --help)"
+        exit 2
+        ;;
+esac
