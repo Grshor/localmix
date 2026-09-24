@@ -200,6 +200,12 @@ cmd_panel() {
 
 # Открыть попап расширения в Zen: браузерные сочетания работают только у
 # сфокусированного окна, поэтому сначала фокусируем Zen, потом посылаем клавиши.
+ext_in_db() { # 0, если расширение установлено в профиль постоянно
+    profile="$(zen_profile)"
+    [ -n "$profile" ] || return 1
+    LC_ALL=C grep -q "zen-tabs@local" "$profile/extensions.json" 2>/dev/null
+}
+
 cmd_popup() {
     # В этой версии Hyprland диспетчеры — Lua-функции: старый «focuswindow class:…»
     # не работает, нужен hl.dsp.focus({window = …}).
@@ -213,12 +219,45 @@ cmd_popup() {
         err "фокус не на Zen (сейчас: ${active:-неизвестно}) — нажми Ctrl+Shift+U в браузере сам"
         return 1
     fi
-    if command -v wtype >/dev/null 2>&1; then
-        wtype -M ctrl -M shift -k u -m shift -m ctrl
-    else
+    if ! command -v wtype >/dev/null 2>&1; then
         err "нет wtype — нажми Ctrl+Shift+U в Zen сам"
         return 1
     fi
+    wtype -M ctrl -M shift -k u -m shift -m ctrl
+    # Если аддона нет в базе профиля, клавиша, скорее всего, ничего не сделает:
+    # временные аддоны исчезают при перезапуске Zen. Предупреждаем, а не молчим.
+    if ! ext_in_db; then
+        notify-send -i dialog-warning "Попап не откроется?" "Расширения нет в профиле Zen — загрузи его (lm ext). Временные аддоны умирают при перезапуске браузера."
+    fi
+}
+
+# Состояние расширения «Разбор вкладок» в профиле Zen: загружено ли, какой uuid,
+# где собранный .xpi. Проверка по базе аддонов: временные аддоны живут до перезапуска
+# браузера, поэтому «не загружено» — самая частая причина «попап не появляется».
+zen_profile() {
+    for d in "$HOME"/.zen/*/; do
+        [ -f "$d/extensions.json" ] || continue
+        printf '%s\n' "$d"
+    done | while read -r d; do
+        printf '%s %s\n' "$(stat -c %Y "$d/extensions.json" 2>/dev/null)" "$d"
+    done | sort -rn | head -1 | cut -d' ' -f2-
+}
+
+cmd_ext() {
+    profile="$(zen_profile)"
+    [ -n "$profile" ] || { err "не нашёл профиль Zen"; return 1; }
+    xpi="$ZT/zen-tabs@local.xpi"
+    printf 'профиль: %s\n' "$profile"
+    uuid="$(grep -o "zen-tabs@local[^,}]*" "$profile/prefs.js" 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)"
+    [ -n "$uuid" ] && printf 'uuid расширения: %s\n' "$uuid"
+    if ext_in_db; then
+        printf 'постоянно установлено: ДА — попап открывается по Ctrl+Shift+U, переживает перезапуск\n'
+    else
+        printf 'постоянно установлено: НЕТ (в базе аддонов профиля его нет)\n'
+        printf 'поставить постоянно: about:addons → шестерёнка → Install Add-on From File… → %s\n' "$xpi"
+        printf 'или загрузить временно: about:debugging → Load Temporary Add-on → %s/extension/manifest.json\n' "$ZT"
+    fi
+    [ -f "$xpi" ] && printf 'собранный .xpi: %s\n' "$xpi" || printf 'собранный .xpi: нет — собери ./bin/make-xpi.sh в %s\n' "$ZT"
 }
 
 # --- план пространств Zen (проект zen-tabs) ---------------------------------
@@ -418,6 +457,7 @@ case "${1:-menu}" in
     logs) shift; cmd_logs "${1:-fast}" "${2:-25}" ;;
     panel) shift; cmd_panel "$@" ;;
     popup) shift; cmd_popup "$@" ;;
+    ext) shift; cmd_ext ;;
     plan) shift; cmd_plan "$@" ;;
     plan-show) shift; cmd_plan_show ;;
     plan-serve) shift; cmd_plan_serve ;;
