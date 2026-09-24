@@ -298,9 +298,17 @@ cmd_plan_model() {
 }
 
 cmd_plan_model_stop() {
-    [ -f "$RUN_DIR/plan-model.pid" ] || { echo "модель планирования не запущена"; return 0; }
-    pid="$(cat "$RUN_DIR/plan-model.pid")"
-    kill "$pid" 2>/dev/null && echo "модель планирования остановлена (pid $pid)"
+    pid=""
+    [ -f "$RUN_DIR/plan-model.pid" ] && pid="$(cat "$RUN_DIR/plan-model.pid")"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        # pid-файл мог потеряться (например, при неудачной остановке) — ищем по порту.
+        pid="$(pgrep -f "llama-server.*--port $PLAN_MODEL" | head -1)"
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null && echo "модель планирования остановлена (pid $pid)"
+    else
+        echo "модель планирования не запущена"
+    fi
     rm -f "$RUN_DIR/plan-model.pid"
 }
 
