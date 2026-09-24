@@ -216,6 +216,32 @@ cmd_plan() { # посчитать план и поднять локальную 
     cmd_plan_serve
 }
 
+cmd_plan_show() { # короткая сводка готового плана
+    [ -f "$PLAN_DIR/plan.json" ] || { err "плана нет — сначала: lm plan-model && lm plan"; return 1; }
+    PLAN_FILE="$PLAN_DIR/plan.json" "$BUN" -e '
+const plan = require(process.env.PLAN_FILE);
+const by = new Map();
+for (const a of plan.assignments) {
+  if (!a.toName) continue;
+  const rec = by.get(a.toName) || { total: 0, moved: 0, groups: new Map() };
+  rec.total++;
+  if (a.from !== a.toName) rec.moved++;
+  rec.groups.set(a.group, (rec.groups.get(a.group) || 0) + 1);
+  by.set(a.toName, rec);
+}
+const rows = [...by.entries()].sort((a, b) => b[1].total - a[1].total);
+console.log(`план от ${String(plan.generatedAt).slice(0, 16).replace("T", " ")}: вкладок ${plan.totalTabs}, переносов ${plan.moves}`);
+console.log("");
+for (const [name, rec] of rows) {
+  const groups = [...rec.groups.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g, n]) => `${g} ${n}`).join(", ");
+  console.log(`${name.padEnd(26)} ${String(rec.total).padStart(4)}  переносов ${String(rec.moved).padStart(4)}   ${groups}`);
+}
+const sizes = rows.map(([, r]) => r.total);
+console.log("");
+console.log(`ровно было бы ${Math.round(plan.totalTabs / rows.length)} на пространство; разброс ${Math.min(...sizes)}–${Math.max(...sizes)}`);
+' PLAN_FILE="$PLAN_DIR/plan.json"
+}
+
 cmd_plan_serve() {
     mkdir -p "$PLAN_DIR"
     if port_alive "$PLAN_PORT"; then
@@ -306,7 +332,7 @@ run_action() {
         tabs) cmd_tabs ;;
         tabs-domain) cmd_tabs --domain ;;
         plan) cmd_plan_model && cmd_plan ;;
-        plan-show) if [ -f "$PLAN_DIR/plan.json" ]; then "$BUN" -e "const p=require('$PLAN_DIR/plan.json'); const by={}; for(const a of p.assignments){ if(!a.toName) continue; by[a.toName]=by[a.toName]||{n:0,m:0}; by[a.toName].n++; if(a.from!==a.toName) by[a.toName].m++; } console.log('вкладок:',p.totalTabs,'| переносов:',p.moves,'| посчитано:',p.generatedAt); for(const [k,v] of Object.entries(by).sort((x,y)=>y[1].n-x[1].n)) console.log('  '+String(v.n).padStart(4)+'  '+k+'  (переносов '+v.m+')');"; else err "плана нет — сначала «План пространств Zen: пересчитать»"; fi ;;
+        plan-show) shift; cmd_plan_show ;;
         eval) (cd "$DIR" && ./semif-eval.sh) ;;
         logs-fast) cmd_logs fast 40 ;;
         logs-think) cmd_logs think 40 ;;
@@ -352,6 +378,7 @@ case "${1:-menu}" in
     logs) shift; cmd_logs "${1:-fast}" "${2:-25}" ;;
     panel) shift; cmd_panel "$@" ;;
     plan) shift; cmd_plan "$@" ;;
+    plan-show) shift; cmd_plan_show ;;
     plan-serve) shift; cmd_plan_serve ;;
     plan-stop) shift; cmd_plan_stop ;;
     plan-model) shift; cmd_plan_model ;;
