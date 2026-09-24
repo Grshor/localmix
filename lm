@@ -32,6 +32,9 @@ while [ -L "$SELF" ]; do
     esac
 done
 DIR="$(cd "$(dirname "$SELF")" && pwd)"
+RUN_DIR="$DIR/run"
+LOG_DIR="$DIR/logs"
+mkdir -p "$RUN_DIR" "$LOG_DIR"
 FAST_PORT="${FAST_PORT:-8091}"
 THINK_PORT="${THINK_PORT:-8092}"
 ZT="$HOME/Projects/zen-tabs"
@@ -209,10 +212,14 @@ cmd_plan() { # посчитать план и поднять локальную 
     [ -d "$ZT" ] || { err "нет $ZT"; return 1; }
     mkdir -p "$PLAN_DIR"
     printf 'считаю план моделью на :%s (это батч, минуты)…\n' "$PLAN_MODEL"
-    (cd "$ZT" && "$BUN" bin/assign.mjs --model "$PLAN_MODEL" --json >"$PLAN_DIR/plan.json") || {
+    # Пишем во временный файл и подменяем в конце: иначе расширение на минуты
+    # увидит пустой plan.json и решит, что плана нет.
+    (cd "$ZT" && "$BUN" bin/assign.mjs --model "$PLAN_MODEL" --json >"$PLAN_DIR/plan.json.tmp") || {
         err "не удалось посчитать план — поднят ли сервер на :$PLAN_MODEL? (lm plan-model)"
+        rm -f "$PLAN_DIR/plan.json.tmp"
         return 1
     }
+    mv "$PLAN_DIR/plan.json.tmp" "$PLAN_DIR/plan.json"
     cmd_plan_serve
 }
 
