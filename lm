@@ -12,6 +12,7 @@
 #   lm plan                посчитать план пространств Zen (модель 4B на CPU) и раздать его
 #   lm plan-model          поднять только модель планирования (4B, CPU, порт 8094)
 #   lm plan-serve          только раздать готовый план на 127.0.0.1:8093
+#   lm plan-fresh          вписать в план, что уже открыто в новых пространствах (перед закрытием)
 #   lm plan-stop           остановить раздачу
 #   lm eval                замер SemIf на 144 авторских пунктах
 #   lm logs [fast|think]   последние строки лога
@@ -359,6 +360,15 @@ cmd_plan_stop() {
     rm -f "$PLAN_DIR/serve.pid"
 }
 
+cmd_plan_fresh() { # отметить в плане вкладки, уже открытые в новых пространствах
+    [ -d "$ZT" ] || { err "нет $ZT"; return 1; }
+    [ -f "$PLAN_DIR/plan.json" ] || { err "плана нет — сначала: lm plan"; return 1; }
+    (cd "$ZT" && PLAN_FILE="$PLAN_DIR/plan.json" "$BUN" bin/plan-fresh.mjs --write) || return 1
+    if [ -x "$ZT/bin/make-xpi.sh" ] && (cd "$ZT" && ./bin/make-xpi.sh >/dev/null 2>&1); then
+        printf 'пересобран %s/zen-tabs@local.xpi — переустанови в Zen (about:addons → Install Add-on From File…)\n' "$ZT"
+    fi
+}
+
 # Модель для планирования: 4B поднимается на CPU, чтобы не вытеснять серверы.
 cmd_plan_model() {
     if port_alive "$PLAN_MODEL"; then
@@ -486,6 +496,7 @@ case "${1:-menu}" in
     plan) shift; cmd_plan "$@" ;;
     plan-show) shift; cmd_plan_show ;;
     plan-serve) shift; cmd_plan_serve ;;
+    plan-fresh) shift; cmd_plan_fresh ;;
     plan-stop) shift; cmd_plan_stop ;;
     plan-model) shift; cmd_plan_model ;;
     plan-model-stop) shift; cmd_plan_model_stop ;;
