@@ -1,8 +1,10 @@
 #!/bin/sh
-# localmix — два локальных сервера llama.cpp для «смеси моделей» на этой машине.
+# localmix — три локальных сервера llama.cpp для «смеси моделей» на этой машине.
 #
-#   fast  : MiniCPM5-2B Q4_K_M    — воркер: 131k контекст, tool-calling, Apache-2.0
-#   think : VibeThinker-3B Q4_K_M — узкий ризонер: математика/код, MIT, БЕЗ tool-calling
+#   fast    : MiniCPM5-2B Q4_K_M        — воркер: 131k контекст, tool-calling, Apache-2.0
+#   think   : VibeThinker-3B Q4_K_M     — узкий ризонер: математика/код, MIT, БЕЗ tool-calling
+#   decider : Qwen3.5-4B Q4_K_M (SemIf) — Jev-класс: состояние + критерий + варианты →
+#                                          буква и вероятность за один проход, Apache-2.0
 #
 # Почему так:
 #   • Порт 8091/8092, а не 8080: 8080 — дефолт Bonsai-demo и порт автообнаружения
@@ -18,13 +20,18 @@
 # Память (замерено, RTX 4070 SUPER 12 282 MiB):
 #   fast  -c 32768: веса 1.56 GB + KV ~0.67 GB
 #   think -c 40960: веса 1.93 GB + KV ~0.72 GB
-#   Оба вместе + рабочий стол занимают 10.0–10.4 GB, свободно 1.4–1.9 GB.
+#   decider -c 8192: веса 2.81 GB + KV ~0.60 GB
+#   fast + think + рабочий стол: 10.0–10.4 GB, свободно 1.4–1.9 GB.
+#   Трое вместе — только если свободно ≥ 4 GB; по умолчанию поднимается пара,
+#   решатель — отдельно (./start.sh decider) или всё сразу (./start.sh full).
 #   Поднять контекст: FAST_CTX=65536 ./start.sh fast  (следи за nvidia-smi).
 #
 # Использование:
-#   ./start.sh            — оба сервера
+#   ./start.sh            — рабочая пара: воркер + ризонер
 #   ./start.sh fast       — только MiniCPM5-2B   (http://127.0.0.1:8091)
 #   ./start.sh think      — только VibeThinker-3B (http://127.0.0.1:8092)
+#   ./start.sh decider    — только SemIf 4B (решатель) (http://127.0.0.1:8095)
+#   ./start.sh full       — все три
 #   ./stop.sh             — остановить
 set -e
 
@@ -40,10 +47,14 @@ export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 FAST_GGUF="${FAST_GGUF:-$MODELS_DIR/MiniCPM5-2B-Q4_K_M.gguf}"
 THINK_GGUF="${THINK_GGUF:-$MODELS_DIR/VibeThinker-3B.Q4_K_M.gguf}"
+# Решатель — чекпойнт проекта SemIf (там же лежит гарнесс, который задаёт формат запроса).
+DECIDER_GGUF="${DECIDER_GGUF:-${SEMIF_DIR:-$HOME/Projects/semif}/models/Qwen_Qwen3.5-4B-Q4_K_M.gguf}"
 FAST_PORT="${FAST_PORT:-8091}"
 THINK_PORT="${THINK_PORT:-8092}"
+DECIDER_PORT="${DECIDER_PORT:-8095}"
 FAST_CTX="${FAST_CTX:-32768}"
 THINK_CTX="${THINK_CTX:-40960}"
+DECIDER_CTX="${DECIDER_CTX:-8192}"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 
@@ -98,9 +109,36 @@ start_think() {
     wait_healthy "$THINK_PORT"
 }
 
+start_decider() {
+    [ -f "$DECIDER_GGUF" ] || {
+        echo "Нет модели: $DECIDER_GGUF" >&2
+        echo "Это чекпойнт проекта SemIf (models/Qwen_Qwen3.5-4B-Q4_K_M.gguf), см. ~/Projects/semif" >&2
+        exit 1
+    }
+    if curl -sf --max-time 2 "http://127.0.0.1:$DECIDER_PORT/health" >/dev/null 2>&1; then
+        echo "decider уже запущен на $DECIDER_PORT"; return 0
+    fi
+    echo "=== Qwen3.5-4B Q4_K_M / SemIf (решатель) → :$DECIDER_PORT ==="
+    # --temp 0: ответ решателя — одна буква из объявленных вариантов, выбор должен
+    # быть воспроизводимым; логиты от температуры не зависят, но клиент может
+    # пользоваться сервером и как обычной моделью.
+    # enable_thinking=false: без него шаблон Qwen3.5 уводит модель в <think>, и
+    # первым токеном становится не буква варианта — а вероятность читается именно
+    # из логитов этой буквы (см. decide.sh).
+    "$BIN" -m "$DECIDER_GGUF" --host 127.0.0.1 --port "$DECIDER_PORT" \
+        -ngl 99 -fa on -c "$DECIDER_CTX" -np 1 --jinja -ctk q8_0 -ctv q8_0 \
+        --temp 0 \
+        --chat-template-kwargs '{"enable_thinking": false}' \
+        >"$LOG_DIR/decider.log" 2>&1 &
+    echo $! >"$RUN_DIR/decider.pid"
+    wait_healthy "$DECIDER_PORT"
+}
+
 case "${1:-all}" in
-    fast)  start_fast ;;
-    think) start_think ;;
-    all)   start_fast; start_think ;;
-    *)     echo "Использование: $0 [fast|think|all]" >&2; exit 2 ;;
+    fast)    start_fast ;;
+    think)   start_think ;;
+    decider) start_decider ;;
+    all)     start_fast; start_think ;;
+    full)    start_fast; start_think; start_decider ;;
+    *)       echo "Использование: $0 [fast|think|decider|all|full]" >&2; exit 2 ;;
 esac
