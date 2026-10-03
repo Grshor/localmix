@@ -2,3 +2,5 @@ models/
 logs/
 run/
 .venv/
+__pycache__/
+*.pyc

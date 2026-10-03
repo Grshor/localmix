@@ -3,7 +3,7 @@
 #
 #   fast    : MiniCPM5-2B Q4_K_M        — воркер: 131k контекст, tool-calling, Apache-2.0
 #   think   : VibeThinker-3B Q4_K_M     — узкий ризонер: математика/код, MIT, БЕЗ tool-calling
-#   decider : Qwen3.5-4B Q4_K_M (SemIf) — Jev-класс: состояние + критерий + варианты →
+#   decider : decider-4b v2.1 Q4_K_M (Mapika) — Jev-класс: состояние + критерий + варианты →
 #                                          буква и вероятность за один проход, Apache-2.0
 #
 # Почему так:
@@ -20,8 +20,9 @@
 # Память (замерено, RTX 4070 SUPER 12 282 MiB):
 #   fast  -c 32768: веса 1.56 GB + KV ~0.67 GB
 #   think -c 40960: веса 1.93 GB + KV ~0.72 GB
-#   decider -c 8192: веса 2.81 GB + KV ~0.60 GB
-#   fast + think + рабочий стол: 10.0–10.4 GB, свободно 1.4–1.9 GB.
+#   decider -c 8192: 3.07 GB в VRAM (веса 2.71 GB)
+#   все трое + рабочий стол: 10.0–10.1 GB занято, 2.2 GB свободно
+#   (замерено 29.09.2026 по процессам: 2360 + 2932 + 3074 MiB).
 #   Трое вместе — только если свободно ≥ 4 GB; по умолчанию поднимается пара,
 #   решатель — отдельно (./start.sh decider) или всё сразу (./start.sh full).
 #   Поднять контекст: FAST_CTX=65536 ./start.sh fast  (следи за nvidia-smi).
@@ -30,7 +31,7 @@
 #   ./start.sh            — рабочая пара: воркер + ризонер
 #   ./start.sh fast       — только MiniCPM5-2B   (http://127.0.0.1:8091)
 #   ./start.sh think      — только VibeThinker-3B (http://127.0.0.1:8092)
-#   ./start.sh decider    — только SemIf 4B (решатель) (http://127.0.0.1:8095)
+#   ./start.sh decider    — только decider-4b v2.1 (решатель) (http://127.0.0.1:8095)
 #   ./start.sh full       — все три
 #   ./stop.sh             — остановить
 set -e
@@ -47,8 +48,9 @@ export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 FAST_GGUF="${FAST_GGUF:-$MODELS_DIR/MiniCPM5-2B-Q4_K_M.gguf}"
 THINK_GGUF="${THINK_GGUF:-$MODELS_DIR/VibeThinker-3B.Q4_K_M.gguf}"
-# Решатель — чекпойнт проекта SemIf (там же лежит гарнесс, который задаёт формат запроса).
-DECIDER_GGUF="${DECIDER_GGUF:-${SEMIF_DIR:-$HOME/Projects/semif}/models/Qwen_Qwen3.5-4B-Q4_K_M.gguf}"
+# Решатель — decider-4b v2.1 (Mapika): не генерирует текст, отдаёт распределение по
+# объявленным вариантам. Рядом должен лежать его decider_config.json (температуры).
+DECIDER_GGUF="${DECIDER_GGUF:-$MODELS_DIR/decider-4b-v2.1-Q4_K_M.gguf}"
 FAST_PORT="${FAST_PORT:-8091}"
 THINK_PORT="${THINK_PORT:-8092}"
 DECIDER_PORT="${DECIDER_PORT:-8095}"
@@ -112,23 +114,22 @@ start_think() {
 start_decider() {
     [ -f "$DECIDER_GGUF" ] || {
         echo "Нет модели: $DECIDER_GGUF" >&2
-        echo "Это чекпойнт проекта SemIf (models/Qwen_Qwen3.5-4B-Q4_K_M.gguf), см. ~/Projects/semif" >&2
+        echo "Скачать: huggingface.co/Mapika/decider-4b-GGUF → models/ (файл и decider_config.json)" >&2
         exit 1
     }
     if curl -sf --max-time 2 "http://127.0.0.1:$DECIDER_PORT/health" >/dev/null 2>&1; then
         echo "decider уже запущен на $DECIDER_PORT"; return 0
     fi
-    echo "=== Qwen3.5-4B Q4_K_M / SemIf (решатель) → :$DECIDER_PORT ==="
-    # --temp 0: ответ решателя — одна буква из объявленных вариантов, выбор должен
-    # быть воспроизводимым; логиты от температуры не зависят, но клиент может
-    # пользоваться сервером и как обычной моделью.
-    # enable_thinking=false: без него шаблон Qwen3.5 уводит модель в <think>, и
-    # первым токеном становится не буква варианта — а вероятность читается именно
-    # из логитов этой буквы (см. decide.sh).
+    echo "=== decider-4b v2.1 Q4_K_M (решатель) → :$DECIDER_PORT ==="
+    # Без --jinja: у чекпойнта в конфиге "layout": "plain", он спрашивается сырым
+    # промптом через /completion (см. decide.py), а не через chat-шаблон. Шаблон
+    # Qwen3.5 добавил бы <|im_start|> и сломал бы раскладку: первым токеном стала бы
+    # не буква варианта, а вероятность читается именно из логитов этой буквы.
+    # --temp 0: выбор буквы должен быть воспроизводимым; логиты от температуры не
+    # зависят (проверено: при temperature 0 и 1.0 в запросе они совпадают).
     "$BIN" -m "$DECIDER_GGUF" --host 127.0.0.1 --port "$DECIDER_PORT" \
-        -ngl 99 -fa on -c "$DECIDER_CTX" -np 1 --jinja -ctk q8_0 -ctv q8_0 \
+        -ngl 99 -fa on -c "$DECIDER_CTX" -np 1 -ctk q8_0 -ctv q8_0 \
         --temp 0 \
-        --chat-template-kwargs '{"enable_thinking": false}' \
         >"$LOG_DIR/decider.log" 2>&1 &
     echo $! >"$RUN_DIR/decider.pid"
     wait_healthy "$DECIDER_PORT"
